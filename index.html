@@ -65,11 +65,20 @@
         .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 9px var(--mint); }
         .model { padding: 8px 11px; border: 1px solid var(--line); border-radius: 9px; color: #9eb8b5; background: rgba(255,255,255,.025); font-size: 11px; }
         .conversation { width: min(720px, calc(100% - 48px)); margin: auto; padding: 47px 0 25px; }
+        .messages { display: flex; flex-direction: column; gap: 16px; margin-bottom: 30px; }
+        .message { max-width: 84%; padding: 14px 16px; border-radius: 15px; color: #d8e9e6; background: rgba(255,255,255,.055); font-size: 14px; line-height: 1.6; animation: rise .25s ease both; }
+        .message.user { align-self: flex-end; color: #092321; background: var(--mint); border-bottom-right-radius: 5px; }
+        .message.assistant { border-bottom-left-radius: 5px; }
+        .message.pending { color: var(--muted); }
+        .message.pending::after { content: ' ...'; color: var(--mint); animation: blink 1s infinite; }
+        @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes blink { 50% { opacity: .2; } }
         .welcome { margin-bottom: 42px; }
         h1 { max-width: 600px; margin: 0 0 15px; color: #f4fbf9; font-family: 'Space Grotesk', sans-serif; font-size: clamp(34px, 5vw, 57px); line-height: 1.04; letter-spacing: -2.8px; }
         h1 span { color: var(--mint); }
         .welcome p { max-width: 440px; margin: 0; color: var(--muted); font-size: 15px; line-height: 1.65; }
         .prompt-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+        .welcome[hidden], .prompt-grid[hidden] { display: none; }
         .prompt { padding: 16px; border: 1px solid var(--line); border-radius: 13px; color: #adc4c1; background: rgba(255,255,255,.025); text-align: left; font: 500 12px 'DM Sans'; cursor: pointer; transition: .2s; }
         .prompt:hover { border-color: rgba(119, 224, 200, .45); background: rgba(119, 224, 200, .07); transform: translateY(-2px); }
         .prompt b { display: block; margin-bottom: 8px; color: var(--mint); font-size: 17px; font-weight: 400; }
@@ -107,6 +116,7 @@
             <header><div class="eyebrow"><span class="status-dot"></span> Orbit is ready to help</div><div class="model">Orbit 1.0 <span style="color: var(--mint)">⌄</span></div></header>
             <section class="conversation">
                 <div class="welcome"><h1>Ideas, meet your <span>co-pilot.</span></h1><p>Ask a question, untangle a thought, or start something new. I’m here to help you move from blank page to bright idea.</p></div>
+                <div class="messages" id="messages" aria-live="polite"></div>
                 <div class="prompt-grid">
                     <button class="prompt" type="button"><b>↗</b>Help me brainstorm a project</button>
                     <button class="prompt" type="button"><b>✎</b>Make my writing clearer</button>
@@ -114,15 +124,66 @@
                     <button class="prompt" type="button"><b>☼</b>Plan my next big thing</button>
                 </div>
             </section>
-            <div class="composer-wrap"><form class="composer" id="chat-form"><textarea id="message" rows="1" placeholder="Message Orbit..." aria-label="Message Orbit"></textarea><button class="send" type="submit" aria-label="Send message">↑</button></form><p class="hint">Orbit can make mistakes. Check important information.</p></div>
+            <div class="composer-wrap"><form class="composer" id="chat-form"><textarea id="message" rows="1" placeholder="Message Orbit..." aria-label="Message Orbit"></textarea><button class="send" id="send-button" type="submit" aria-label="Send message">↑</button></form><p class="hint">Enter to send · Shift + Enter for a new line</p></div>
         </main>
     </div>
     <script>
         const message = document.getElementById('message');
         const form = document.getElementById('chat-form');
-        document.querySelectorAll('.prompt').forEach((prompt) => prompt.addEventListener('click', () => { message.value = prompt.textContent.trim(); message.focus(); }));
+        const messages = document.getElementById('messages');
+        const sendButton = document.getElementById('send-button');
+        const welcome = document.querySelector('.welcome');
+        const promptGrid = document.querySelector('.prompt-grid');
+        const newChat = document.querySelector('.new-chat');
+        document.querySelectorAll('.prompt').forEach((prompt) => prompt.addEventListener('click', () => { message.value = prompt.textContent.replace(prompt.querySelector('b').textContent, '').trim(); message.focus(); }));
         message.addEventListener('input', () => { message.style.height = 'auto'; message.style.height = `${Math.min(message.scrollHeight, 110)}px`; });
-        form.addEventListener('submit', (event) => { event.preventDefault(); if (message.value.trim()) { message.value = ''; message.style.height = 'auto'; message.placeholder = 'Message received — chat connection coming soon'; } });
+        message.addEventListener('keydown', (event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); form.requestSubmit(); } });
+
+        function addMessage(text, role, pending = false) {
+            const item = document.createElement('div');
+            item.className = `message ${role}${pending ? ' pending' : ''}`;
+            item.textContent = text;
+            messages.appendChild(item);
+            item.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            return item;
+        }
+
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const text = message.value.trim();
+            if (!text || form.classList.contains('busy')) return;
+            form.classList.add('busy');
+            sendButton.disabled = true;
+            welcome.hidden = true;
+            promptGrid.hidden = true;
+            addMessage(text, 'user');
+            message.value = '';
+            message.style.height = 'auto';
+            const pending = addMessage('Orbit is thinking', 'assistant', true);
+
+            try {
+                const response = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: text }) });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || 'Unable to reach Orbit.');
+                pending.remove();
+                addMessage(data.reply, 'assistant');
+            } catch (error) {
+                pending.textContent = error.message;
+                pending.classList.remove('pending');
+            } finally {
+                form.classList.remove('busy');
+                sendButton.disabled = false;
+                message.focus();
+            }
+        });
+
+        newChat.addEventListener('click', () => {
+            messages.replaceChildren();
+            welcome.hidden = false;
+            promptGrid.hidden = false;
+            message.value = '';
+            message.focus();
+        });
     </script>
 </body>
 </html>
