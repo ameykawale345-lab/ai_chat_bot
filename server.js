@@ -2,102 +2,87 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
-const port = Number(process.env.PORT) || 3000;
+const PORT = process.env.PORT || 3000;
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
+const ANTHROPIC_VERSION = "2023-06-01";
+const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
+const MAX_TOKENS = 1024;
 
-function sendJson(res, statusCode, payload) {
-    res.writeHead(statusCode, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(payload));
+// Models Orbit is allowed to route to. The client picks one; we validate it here.
+const ALLOWED_MODELS = {
+    "claude-sonnet-5": "claude-sonnet-5",
+    "claude-haiku-4-5": "claude-haiku-4-5-20251001",
+    "claude-opus-4-8": "claude-opus-4-8",
+};
+const DEFAULT_MODEL = "claude-sonnet-5";
+
+const SYSTEM_PROMPT = `You are Orbit, a sharp, warm AI thinking companion built into a small chat app.
+Be genuinely useful: give direct answers first, then brief supporting detail. Default to concise
+responses; expand only when the question calls for depth. Use markdown formatting (headers, bold,
+lists, code blocks) when it improves clarity, but don't over-format simple replies. Ask at most one
+clarifying question, and only when it's truly needed to give a good answer. Be honest about
+uncertainty instead of guessing confidently.`;
+
+// ---------------------------------------------------------------------------
+// Tiny in-memory rate limiter (per IP, sliding window). Good enough for a
+// small single-instance app; swap for a real store if you ever scale this out.
+// ---------------------------------------------------------------------------
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_MAX = 30;
+const requestLog = new Map();
+
+function isRateLimited(ip) {
+    const now = Date.now();
+    const timestamps = (requestLog.get(ip) || []).filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+    timestamps.push(now);
+    requestLog.set(ip, timestamps);
+    return timestamps.length > RATE_LIMIT_MAX;
 }
 
+// ---------------------------------------------------------------------------
+// Fallback "brain" used only when no ANTHROPIC_API_KEY is configured, so the
+// app still runs out of the box in a limited demo mode.
+// ---------------------------------------------------------------------------
 function normalizeMessage(message) {
     return message.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
 }
 
-function createReply(message) {
+function fallbackReply(message) {
     const text = normalizeMessage(message);
     const topic = message
         .replace(/^(can you|could you|please|help me|tell me|explain|what is|what are|how do i|how can i|i need help with)\s+/i, "")
         .replace(/[?.!]+$/, "")
         .trim();
 
-    if (!text) {
-        return "I’m here to help. Say hi, ask a question, or tell me what you want to do today.";
+    if (!text) return "I'm here to help. Say hi, ask a question, or tell me what you want to do today.";
+    if (/(^|\s)(hi|hello|hey|hey there|yo|sup)\b/.test(text)) {
+        return "Hey! I'm Orbit, running in demo mode right now (no API key configured). Add an ANTHROPIC_API_KEY to unlock real answers — see the README.";
     }
-
-    if (/(^|\s)(hi|hello|hey|hey there|yo|sup)\b/.test(text) || /^greetings?\b/.test(text)) {
-        return "Hey! I’m Orbit. Tell me what you’re working on, and I’ll help you with a clear next step.";
-    }
-
-    if (/(plan|schedule|routine|day plan).*(my day|today|day)/.test(text) || /plan my day/.test(text) || /help me plan my day/.test(text)) {
-        return "Here’s a simple day plan: start with your top 3 priorities, do the hardest task in your best focus window, block time for quick wins, and leave a short break before the end of the day. Want me to tailor it to your work, study, or personal goals?";
-    }
-
-    if (text.includes("brainstorm") || text.includes("idea")) {
-        return `For ${topic || "that idea"}, start by defining who it helps and the one problem it solves. Then choose the smallest version you could finish this week. What part should we shape first: the audience, the features, or the first step?`;
-    }
-
-    if (text.includes("clear") || text.includes("writing") || text.includes("rewrite")) {
-        return `I can help improve ${topic || "your writing"}. Paste the text and tell me the intended audience and tone. I’ll make it clearer while preserving your meaning.`;
-    }
-
-    if (text.includes("code") || text.includes("bug") || text.includes("javascript") || text.includes("python") || text.includes("html")) {
-        return `I can help troubleshoot ${topic || "that code"}. Send the relevant code, the error message, and what you expected to happen. I’ll trace the likely cause and suggest a focused fix.`;
-    }
-
-    if (text.includes("webhook")) {
-        return "A webhook is an automatic message sent from one app to another when an event happens. For example, a payment service can send your server a POST request when a payment succeeds, so your app can react immediately instead of repeatedly checking for updates.";
-    }
-
-    if (text.includes("explain") || text.includes("how does") || text.includes("what is")) {
-        return `Here’s the short version of ${topic || "that"}: I need one bit more context to give you an accurate explanation. What are you using it for, or which part feels confusing?`;
-    }
-
-    if (text.includes("plan") || text.includes("next")) {
-        return `For ${topic || "your plan"}, define the outcome first, then choose one action that can be finished in 20 minutes. What deadline or constraint should the plan account for?`;
-    }
-
-    return `I can help with ${topic || "that"}. What result are you aiming for, and what have you tried already? That will let me give you a specific next step instead of guessing.`;
+    return `I can help with ${topic || "that"} once you add an ANTHROPIC_API_KEY environment variable — I'm currently running in limited demo mode. See the README for setup.`;
 }
 
-async function getAIReply(message) {
-    const apiKey = process.env.OPENAI_API_KEY;
-
-    if (!apiKey || typeof fetch !== "function") {
-        return createReply(message);
-    }
-
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-            model: "gpt-4o-mini",
-            messages: [
-                { role: "system", content: "You are Orbit, a helpful AI assistant that gives practical, clear, and supportive answers." },
-                { role: "user", content: message },
-            ],
-            temperature: 0.7,
-        }),
-    });
-
-    const data = await response.json();
-
-    if (!response.ok) {
-        const errorMessage = data?.error?.message || "The AI service returned an error.";
-        throw new Error(errorMessage);
-    }
-
-    return data.choices?.[0]?.message?.content?.trim() || "I’m here, but I couldn’t generate a response right now.";
+// ---------------------------------------------------------------------------
+// HTTP helpers
+// ---------------------------------------------------------------------------
+function sendJson(res, statusCode, payload) {
+    res.writeHead(statusCode, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(payload));
 }
 
 function readRequestBody(req, callback) {
     let body = "";
-    req.on("data", (chunk) => { body += chunk; });
+    let tooLarge = false;
+    req.on("data", (chunk) => {
+        body += chunk;
+        if (body.length > 200_000) {
+            tooLarge = true;
+            req.destroy();
+        }
+    });
     req.on("end", () => {
+        if (tooLarge) return callback(new Error("Message too large"));
         try {
-            callback(null, JSON.parse(body || "{}"));
+            callback(null, JSON.parse(body));
         } catch {
             callback(new Error("Invalid JSON"));
         }
@@ -105,19 +90,165 @@ function readRequestBody(req, callback) {
     req.on("error", callback);
 }
 
+function sanitizeHistory(rawMessages) {
+    if (!Array.isArray(rawMessages)) return [];
+    return rawMessages
+        .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
+        .map((m) => ({ role: m.role, content: m.content.slice(0, 8000) }))
+        .slice(-40); // cap history length sent per request
+}
+
+// ---------------------------------------------------------------------------
+// Streams a Claude response. Calls onDelta(text) for each text chunk as it
+// arrives and resolves with the full text once the stream ends.
+// ---------------------------------------------------------------------------
+async function streamClaude({ model, messages, signal, onDelta }) {
+    const upstream = await fetch(ANTHROPIC_URL, {
+        method: "POST",
+        signal,
+        headers: {
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": ANTHROPIC_VERSION,
+        },
+        body: JSON.stringify({
+            model,
+            max_tokens: MAX_TOKENS,
+            system: SYSTEM_PROMPT,
+            messages,
+            stream: true,
+        }),
+    });
+
+    if (!upstream.ok || !upstream.body) {
+        let detail = "";
+        try {
+            const errJson = await upstream.json();
+            detail = errJson?.error?.message || "";
+        } catch {
+            // ignore parse failure, use generic message below
+        }
+        const err = new Error(detail || `Claude API error (${upstream.status})`);
+        err.status = upstream.status;
+        throw err;
+    }
+
+    const reader = upstream.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let fullText = "";
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const events = buffer.split("\n\n");
+        buffer = events.pop() || "";
+
+        for (const rawEvent of events) {
+            const dataLine = rawEvent.split("\n").find((line) => line.startsWith("data:"));
+            if (!dataLine) continue;
+            const jsonStr = dataLine.slice(5).trim();
+            if (!jsonStr) continue;
+
+            let payload;
+            try {
+                payload = JSON.parse(jsonStr);
+            } catch {
+                continue;
+            }
+
+            if (payload.type === "content_block_delta" && payload.delta?.type === "text_delta") {
+                const chunk = payload.delta.text;
+                fullText += chunk;
+                onDelta(chunk);
+            } else if (payload.type === "error") {
+                throw new Error(payload.error?.message || "Claude API stream error");
+            }
+        }
+    }
+
+    return fullText;
+}
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
 const server = http.createServer((req, res) => {
     if (req.method === "POST" && req.url === "/api/chat") {
+        const ip = req.socket.remoteAddress || "unknown";
+        if (isRateLimited(ip)) {
+            sendJson(res, 429, { error: "You're sending messages a bit fast — try again in a moment." });
+            return;
+        }
+
         readRequestBody(req, async (error, body) => {
-            if (error || !body.message || typeof body.message !== "string" || !body.message.trim()) {
-                sendJson(res, 400, { error: "Please send a message." });
+            if (error) {
+                sendJson(res, 400, { error: error.message === "Message too large" ? error.message : "Please send valid JSON." });
                 return;
             }
 
+            const message = typeof body.message === "string" ? body.message.trim() : "";
+            if (!message) {
+                sendJson(res, 400, { error: "Please send a message." });
+                return;
+            }
+            if (message.length > 8000) {
+                sendJson(res, 400, { error: "That message is too long — try trimming it a bit." });
+                return;
+            }
+
+            const history = sanitizeHistory(body.history);
+            const requestedModel = typeof body.model === "string" ? body.model : DEFAULT_MODEL;
+            const model = ALLOWED_MODELS[requestedModel] || ALLOWED_MODELS[DEFAULT_MODEL];
+            const messages = [...history, { role: "user", content: message }];
+
+            // No API key configured: fall back to the offline canned responder,
+            // returned as a single chunk so the client streaming code still works.
+            if (!ANTHROPIC_API_KEY) {
+                res.writeHead(200, {
+                    "Content-Type": "text/plain; charset=utf-8",
+                    "Transfer-Encoding": "chunked",
+                    "X-Orbit-Mode": "demo",
+                });
+                res.end(fallbackReply(message));
+                return;
+            }
+
+            res.writeHead(200, {
+                "Content-Type": "text/plain; charset=utf-8",
+                "Transfer-Encoding": "chunked",
+                "X-Orbit-Mode": "live",
+            });
+
+            const controller = new AbortController();
+            req.on("close", () => controller.abort());
+
             try {
-                const reply = await getAIReply(body.message.trim());
-                sendJson(res, 200, { reply });
+                await streamClaude({
+                    model,
+                    messages,
+                    signal: controller.signal,
+                    onDelta: (chunk) => res.write(chunk),
+                });
             } catch (err) {
-                sendJson(res, 500, { error: err.message || "Unable to generate a response." });
+                if (err.name === "AbortError") {
+                    // client disconnected / stopped generation — nothing to do
+                } else {
+                    console.error("Claude API error:", err.message);
+                    if (!res.headersSent) {
+                        sendJson(res, err.status === 401 ? 401 : 502, {
+                            error: err.status === 401
+                                ? "The API key on the server looks invalid."
+                                : "Orbit couldn't reach Claude just now. Please try again.",
+                        });
+                        return;
+                    }
+                    res.write(`\n\n[Orbit hit an error: ${err.message}]`);
+                }
+            } finally {
+                res.end();
             }
         });
         return;
@@ -135,17 +266,14 @@ const server = http.createServer((req, res) => {
             res.end("Error loading HTML file");
             return;
         }
-
         res.writeHead(200, { "Content-Type": "text/html" });
         res.end(data);
     });
 });
 
-server.listen(port, () => {
-    console.log(`Server running at http://localhost:${port}`);
-    if (!process.env.OPENAI_API_KEY) {
-        console.log("OPENAI_API_KEY not set. Falling back to local reply logic until configured.");
+server.listen(PORT, () => {
+    if (!ANTHROPIC_API_KEY) {
+        console.log(`⚠ ANTHROPIC_API_KEY not set — Orbit is running in limited demo mode.`);
     }
+    console.log(`Orbit running at http://localhost:${PORT}`);
 });
-
-module.exports = { createReply, getAIReply };

@@ -1,13 +1,16 @@
 {
-  "name": "ai_chat_bot",
-  "version": "1.0.0",
-  "description": "AI chat bot web app",
+  "name": "orbit-ai-chat",
+  "version": "2.0.0",
+  "description": "Orbit — a Claude-powered chat companion with streaming responses, model switching, and markdown rendering.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "echo \"No tests configured\" && exit 0"
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": ["claude", "anthropic", "chatbot", "ai"],
   "author": "",
   "license": "ISC",
   "type": "commonjs"
