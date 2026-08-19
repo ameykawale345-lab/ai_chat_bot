@@ -2,7 +2,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 
-const port = 3000;
+const port = Number(process.env.PORT) || 3000;
 
 function sendJson(res, statusCode, payload) {
     res.writeHead(statusCode, { "Content-Type": "application/json" });
@@ -59,12 +59,45 @@ function createReply(message) {
     return `I can help with ${topic || "that"}. What result are you aiming for, and what have you tried already? That will let me give you a specific next step instead of guessing.`;
 }
 
+async function getAIReply(message) {
+    const apiKey = process.env.OPENAI_API_KEY;
+
+    if (!apiKey || typeof fetch !== "function") {
+        return createReply(message);
+    }
+
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+            model: "gpt-4o-mini",
+            messages: [
+                { role: "system", content: "You are Orbit, a helpful AI assistant that gives practical, clear, and supportive answers." },
+                { role: "user", content: message },
+            ],
+            temperature: 0.7,
+        }),
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+        const errorMessage = data?.error?.message || "The AI service returned an error.";
+        throw new Error(errorMessage);
+    }
+
+    return data.choices?.[0]?.message?.content?.trim() || "I’m here, but I couldn’t generate a response right now.";
+}
+
 function readRequestBody(req, callback) {
     let body = "";
     req.on("data", (chunk) => { body += chunk; });
     req.on("end", () => {
         try {
-            callback(null, JSON.parse(body));
+            callback(null, JSON.parse(body || "{}"));
         } catch {
             callback(new Error("Invalid JSON"));
         }
@@ -74,13 +107,18 @@ function readRequestBody(req, callback) {
 
 const server = http.createServer((req, res) => {
     if (req.method === "POST" && req.url === "/api/chat") {
-        readRequestBody(req, (error, body) => {
+        readRequestBody(req, async (error, body) => {
             if (error || !body.message || typeof body.message !== "string" || !body.message.trim()) {
                 sendJson(res, 400, { error: "Please send a message." });
                 return;
             }
 
-            sendJson(res, 200, { reply: createReply(body.message.trim()) });
+            try {
+                const reply = await getAIReply(body.message.trim());
+                sendJson(res, 200, { reply });
+            } catch (err) {
+                sendJson(res, 500, { error: err.message || "Unable to generate a response." });
+            }
         });
         return;
     }
@@ -105,4 +143,9 @@ const server = http.createServer((req, res) => {
 
 server.listen(port, () => {
     console.log(`Server running at http://localhost:${port}`);
+    if (!process.env.OPENAI_API_KEY) {
+        console.log("OPENAI_API_KEY not set. Falling back to local reply logic until configured.");
+    }
 });
+
+module.exports = { createReply, getAIReply };
