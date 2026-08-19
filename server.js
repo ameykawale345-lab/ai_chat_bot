@@ -3,9 +3,12 @@ const fs = require("fs");
 const path = require("path");
 
 const PORT = process.env.PORT || 3000;
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 const ANTHROPIC_VERSION = "2023-06-01";
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+const GROQ_MODEL = "llama-3.1-8b-instant";
 const MAX_TOKENS = 1024;
 
 // Models Orbit is allowed to route to. The client picks one; we validate it here.
@@ -96,6 +99,77 @@ function sanitizeHistory(rawMessages) {
         .filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string")
         .map((m) => ({ role: m.role, content: m.content.slice(0, 8000) }))
         .slice(-40); // cap history length sent per request
+}
+
+// ---------------------------------------------------------------------------
+// Streams a Groq/OpenAI-compatible response. Groq keys use the gsk_ prefix,
+// but the endpoint accepts OpenAI-style chat completions requests.
+// ---------------------------------------------------------------------------
+async function streamGroq({ messages, signal, onDelta }) {
+    const upstream = await fetch(GROQ_URL, {
+        method: "POST",
+        signal,
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${GROQ_API_KEY}`,
+        },
+        body: JSON.stringify({
+            model: GROQ_MODEL,
+            messages: [
+                { role: "system", content: SYSTEM_PROMPT },
+                ...messages,
+            ],
+            temperature: 0.7,
+            stream: true,
+        }),
+    });
+
+    if (!upstream.ok || !upstream.body) {
+        let detail = "";
+        try {
+            const errJson = await upstream.json();
+            detail = errJson?.error?.message || "";
+        } catch {
+            // ignore parse failure and use generic fallback below
+        }
+        const err = new Error(detail || `Groq API error (${upstream.status})`);
+        err.status = upstream.status;
+        throw err;
+    }
+
+    const reader = upstream.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let fullText = "";
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split("\n");
+        buffer = "";
+
+        for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed || !trimmed.startsWith("data:")) continue;
+            const payloadText = trimmed.slice(5).trim();
+            if (payloadText === "[DONE]") continue;
+
+            try {
+                const payload = JSON.parse(payloadText);
+                const chunk = payload.choices?.[0]?.delta?.content;
+                if (typeof chunk === "string") {
+                    fullText += chunk;
+                    onDelta(chunk);
+                }
+            } catch {
+                // ignore incomplete stream frames
+            }
+        }
+    }
+
+    return fullText;
 }
 
 // ---------------------------------------------------------------------------
@@ -204,9 +278,9 @@ const server = http.createServer((req, res) => {
             const model = ALLOWED_MODELS[requestedModel] || ALLOWED_MODELS[DEFAULT_MODEL];
             const messages = [...history, { role: "user", content: message }];
 
-            // No API key configured: fall back to the offline canned responder,
+            // No AI key configured: fall back to the offline canned responder,
             // returned as a single chunk so the client streaming code still works.
-            if (!ANTHROPIC_API_KEY) {
+            if (!GROQ_API_KEY && !ANTHROPIC_API_KEY) {
                 res.writeHead(200, {
                     "Content-Type": "text/plain; charset=utf-8",
                     "Transfer-Encoding": "chunked",
@@ -219,29 +293,38 @@ const server = http.createServer((req, res) => {
             res.writeHead(200, {
                 "Content-Type": "text/plain; charset=utf-8",
                 "Transfer-Encoding": "chunked",
-                "X-Orbit-Mode": "live",
+                "X-Orbit-Mode": GROQ_API_KEY ? "live-groq" : "live",
             });
 
             const controller = new AbortController();
             req.on("close", () => controller.abort());
 
             try {
-                await streamClaude({
-                    model,
-                    messages,
-                    signal: controller.signal,
-                    onDelta: (chunk) => res.write(chunk),
-                });
+                if (GROQ_API_KEY) {
+                    await streamGroq({
+                        messages,
+                        signal: controller.signal,
+                        onDelta: (chunk) => res.write(chunk),
+                    });
+                } else {
+                    await streamClaude({
+                        model,
+                        messages,
+                        signal: controller.signal,
+                        onDelta: (chunk) => res.write(chunk),
+                    });
+                }
             } catch (err) {
                 if (err.name === "AbortError") {
                     // client disconnected / stopped generation — nothing to do
                 } else {
-                    console.error("Claude API error:", err.message);
+                    const providerName = GROQ_API_KEY ? "Groq" : "Claude";
+                    console.error(`${providerName} API error:`, err.message);
                     if (!res.headersSent) {
                         sendJson(res, err.status === 401 ? 401 : 502, {
                             error: err.status === 401
                                 ? "The API key on the server looks invalid."
-                                : "Orbit couldn't reach Claude just now. Please try again.",
+                                : `Orbit couldn't reach ${providerName} just now. Please try again.`,
                         });
                         return;
                     }
@@ -272,8 +355,12 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-    if (!ANTHROPIC_API_KEY) {
-        console.log(`⚠ ANTHROPIC_API_KEY not set — Orbit is running in limited demo mode.`);
+    if (!GROQ_API_KEY && !ANTHROPIC_API_KEY) {
+        console.log(`⚠ No AI API key configured — Orbit is running in limited demo mode.`);
+    } else if (GROQ_API_KEY) {
+        console.log(`✅ Groq API key detected — Orbit is using the Groq provider.`);
+    } else {
+        console.log(`✅ Anthropic API key detected — Orbit is using the Anthropic provider.`);
     }
     console.log(`Orbit running at http://localhost:${PORT}`);
 });
