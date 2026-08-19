@@ -9,9 +9,28 @@ function sendJson(res, statusCode, payload) {
     res.end(JSON.stringify(payload));
 }
 
+function normalizeMessage(message) {
+    return message.toLowerCase().replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
+}
+
 function createReply(message) {
-    const text = message.toLowerCase();
-    const topic = message.replace(/^(can you|could you|please|help me|tell me|explain|what is|what are|how do i)\s+/i, "").replace(/[?.!]+$/, "").trim();
+    const text = normalizeMessage(message);
+    const topic = message
+        .replace(/^(can you|could you|please|help me|tell me|explain|what is|what are|how do i|how can i|i need help with)\s+/i, "")
+        .replace(/[?.!]+$/, "")
+        .trim();
+
+    if (!text) {
+        return "I’m here to help. Say hi, ask a question, or tell me what you want to do today.";
+    }
+
+    if (/(^|\s)(hi|hello|hey|hey there|yo|sup)\b/.test(text) || /^greetings?\b/.test(text)) {
+        return "Hey! I’m Orbit. Tell me what you’re working on, and I’ll help you with a clear next step.";
+    }
+
+    if (/(plan|schedule|routine|day plan).*(my day|today|day)/.test(text) || /plan my day/.test(text) || /help me plan my day/.test(text)) {
+        return "Here’s a simple day plan: start with your top 3 priorities, do the hardest task in your best focus window, block time for quick wins, and leave a short break before the end of the day. Want me to tailor it to your work, study, or personal goals?";
+    }
 
     if (text.includes("brainstorm") || text.includes("idea")) {
         return `For ${topic || "that idea"}, start by defining who it helps and the one problem it solves. Then choose the smallest version you could finish this week. What part should we shape first: the audience, the features, or the first step?`;
@@ -35,10 +54,6 @@ function createReply(message) {
 
     if (text.includes("plan") || text.includes("next")) {
         return `For ${topic || "your plan"}, define the outcome first, then choose one action that can be finished in 20 minutes. What deadline or constraint should the plan account for?`;
-    }
-
-    if (text.includes("hello") || text.includes("hi ") || text === "hi") {
-        return "Hey! I’m Orbit. Tell me what you’re working on, and we’ll find a useful next step together.";
     }
 
     return `I can help with ${topic || "that"}. What result are you aiming for, and what have you tried already? That will let me give you a specific next step instead of guessing.`;
