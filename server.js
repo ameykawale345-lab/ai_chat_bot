@@ -8,7 +8,7 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "";
 const ANTHROPIC_VERSION = "2023-06-01";
 const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL = "llama-3.1-8b-instant";
+const GROQ_MODEL = "openai/gpt-oss-120b";
 const MAX_TOKENS = 1024;
 
 // Models Orbit is allowed to route to. The client picks one; we validate it here.
@@ -297,7 +297,13 @@ const server = http.createServer((req, res) => {
             });
 
             const controller = new AbortController();
-            req.on("close", () => controller.abort());
+            let responseFinished = false;
+            res.on("finish", () => {
+                responseFinished = true;
+            });
+            res.on("close", () => {
+                if (!responseFinished) controller.abort();
+            });
 
             try {
                 if (GROQ_API_KEY) {
